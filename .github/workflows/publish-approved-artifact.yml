@@ -1,0 +1,60 @@
+name: Publish Approved Artifact
+on:
+  push:
+    branches: [main]
+    paths: ['publish/requests/**.json']
+permissions: {contents: write, actions: read}
+concurrency: {group: publish-questions, cancel-in-progress: false}
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@v6
+        with: {fetch-depth: 2}
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - run: |
+          if ! command -v ffprobe >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y ffmpeg; fi
+          python -m pip install --upgrade pip boto3
+      - id: req
+        run: |
+          REQUEST=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep '^publish/requests/.*\.json$' | head -n1); test -n "$REQUEST"
+          python -m json.tool "$REQUEST" >/dev/null
+          for key in run_id artifact_name audio_filename audio_sha256 slug title description prefix; do value=$(jq -r --arg k "$key" '.[$k] // empty' "$REQUEST"); test -n "$value"; echo "$key<<EOF" >> "$GITHUB_OUTPUT"; echo "$value" >> "$GITHUB_OUTPUT"; echo EOF >> "$GITHUB_OUTPUT"; done
+      - env: {SLUG: "${{ steps.req.outputs.slug }}"}
+        run: |
+          ! grep -q "<guid[^>]*>${SLUG}</guid>" feed.xml || { echo "GUID exists"; exit 1; }
+          NEXT=$(python -c 'import re,pathlib; s=pathlib.Path("feed.xml").read_text(); n=[int(x) for x in re.findall(r"<guid[^>]*>ep(\d+)-",s)]; print(max(n)+1 if n else 1)'); REQ=$(python -c 'import re,sys; print(int(re.match(r"ep(\d+)-",sys.argv[1]).group(1)))' "$SLUG"); test "$REQ" = "$NEXT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: "${{ steps.req.outputs.artifact_name }}"
+          path: approved
+          repository: "${{ github.repository }}"
+          run-id: "${{ steps.req.outputs.run_id }}"
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+      - id: meta
+        env: {FILE: "${{ steps.req.outputs.audio_filename }}", EXPECTED_SHA: "${{ steps.req.outputs.audio_sha256 }}"}
+        run: |
+          AUDIO="approved/$FILE"; test -s "$AUDIO"; test "$(sha256sum "$AUDIO"|awk '{print $1}')" = "$EXPECTED_SHA"
+          BYTES=$(stat -c %s "$AUDIO"); SECONDS=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$AUDIO"); DURATION=$(python -c 'import sys;s=round(float(sys.argv[1]));print(f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}")' "$SECONDS")
+          echo "audio=$AUDIO" >> "$GITHUB_OUTPUT"; echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"; echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+      - env:
+          SLUG: "${{ steps.req.outputs.slug }}"
+          TITLE: "${{ steps.req.outputs.title }}"
+          DESCRIPTION: "${{ steps.req.outputs.description }}"
+          PREFIX: "${{ steps.req.outputs.prefix }}"
+          AUDIO: "${{ steps.meta.outputs.audio }}"
+          DURATION: "${{ steps.meta.outputs.duration }}"
+        run: python scripts/publish_episode.py --audio "$AUDIO" --slug "$SLUG" --title "$TITLE" --description "$DESCRIPTION" --duration "$DURATION" --prefix "$PREFIX"
+      - env: {SLUG: "${{ steps.req.outputs.slug }}", EXPECTED_BYTES: "${{ steps.meta.outputs.bytes }}", EXPECTED_DURATION: "${{ steps.meta.outputs.duration }}"}
+        run: |
+          python -c 'import os,xml.etree.ElementTree as ET; ch=ET.parse("feed.xml").getroot().find("channel"); i=ch.find("item"); ns={"itunes":"http://www.itunes.com/dtds/podcast-1.0.dtd"}; assert i.findtext("guid")==os.environ["SLUG"]; assert i.findtext("itunes:duration",namespaces=ns)==os.environ["EXPECTED_DURATION"]; assert int(i.find("enclosure").attrib["length"])==int(os.environ["EXPECTED_BYTES"])'
+          git config user.name github-actions[bot]; git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add feed.xml; git commit -m "Publish ${SLUG} from approved artifact [skip ci]"; git push
